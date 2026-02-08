@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 _COMPILE_ENABLED = contextvars.ContextVar("_COMPILE_ENABLED", default=False)
 
-
+## setter for global variable _COMPILE_ENABLED
 @contextmanager
 def set_compiled(enabled: bool = True):
     token = _COMPILE_ENABLED.set(enabled)
@@ -96,7 +96,7 @@ def _mark_dynamic_on_value(val, dims):
                 torch._dynamo.mark_dynamic(t, _normalize_dims(dims, t.ndim))
         # else: ignore (None or non-tensor)
 
-
+## what kind of args is this getting?
 def _infer_dynamic_arg_dims_from_annotations(forward_fn):
     sig = inspect.signature(forward_fn)
     dyn = {}
@@ -120,7 +120,7 @@ def _infer_dynamic_arg_dims_from_annotations(forward_fn):
         raise ValueError("No dynamic dims inferred; pass dynamic_arg_dims explicitly.")
     return dyn
 
-
+## JIT Compilation for torch modules with SGLang backend
 def install_torch_compiled(
     module: torch.nn.Module,
     *,
@@ -131,13 +131,17 @@ def install_torch_compiled(
     graph_pool: Any = None,
 ):
     rank0_log(f"install_torch_compiled")
+
+    ## Non compiled fwd method
     unbound_fwd = module.__class__.forward
+
     if not callable(unbound_fwd):
         raise TypeError("module.__class__.forward must be callable")
     original_code = unbound_fwd.__code__
 
     dyn_map = dynamic_arg_dims or _infer_dynamic_arg_dims_from_annotations(unbound_fwd)
 
+    ## What kind of compilation we are doing, based on backend, piecewise or full? other types maybe there
     if backend_factory is None:
         from sglang.srt.compilation.backend import SGLangBackend
 
@@ -148,6 +152,7 @@ def install_torch_compiled(
     compiled_codes: list[type(original_code)] = []
     state = {"compiled": False, "compiled_callable": None}
 
+    ## Find out what this hook is doing?
     def bytecode_hook(old_code, new_code):
         if old_code is not original_code:
             return
@@ -168,7 +173,8 @@ def install_torch_compiled(
         if dynamo_frame.f_locals.get("self") is not module:
             return
         compiled_codes.append(new_code)
-
+    
+    ## Where this hook latches on to?
     torch._dynamo.convert_frame.register_bytecode_hook(bytecode_hook)
 
     def _ensure_compiled(self, *args, **kwargs):
@@ -198,7 +204,9 @@ def install_torch_compiled(
 
         state["compiled"] = True
         state["compiled_callable"] = compiled_callable
-
+    
+    ## This is where it checks if compiled, the runs the compiled version else compiles it first
+    ## If we dont want compiled then return the original code (unbound forward)
     def trampoline(self, *args, **kwargs):
         use_compiled = _COMPILE_ENABLED.get()
         if use_compiled:

@@ -34,7 +34,7 @@ def make_compiler(config: CompilationConfig):
     else:
         raise ValueError(f"Unknown compiler: {config.compiler}")
 
-
+## Choose backend for cuda/npu for piecewise respectively
 def make_backend(
     graph: fx.GraphModule,
     compile_config: CompilationConfig,
@@ -60,7 +60,7 @@ def make_backend(
         sglang_backend,
     )
 
-
+## This compiles, saves and loads compiled code
 class CompilerManager:
     def __init__(
         self,
@@ -261,7 +261,9 @@ global_graph_pool = None
 
 compilation_start_time = 0.0
 
-
+## What does interpreter means here? 
+## Args: Graph module, list of compiled sub modules, inductor config (idk what inductor is)
+## backend name, graph pool memory
 class PiecewiseCompileInterpreter(torch.fx.Interpreter):
     def __init__(
         self,
@@ -285,13 +287,17 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         self.compile_config = compile_config
 
     def run(self, *args):
+
+        ## What are these fake args?
         fake_args = [
             self.fake_mode.from_tensor(t) if isinstance(t, torch.Tensor) else t
             for t in args
         ]
         with self.fake_mode, enable_python_dispatcher():
             return super().run(*fake_args)
-
+    
+    ## This seems like we are compiling and making backend of only target module within the submodule list
+    ## But need to deep dive into the syntax
     def call_module(
         self,
         target: torch.fx.node.Target,
@@ -353,7 +359,7 @@ def set_model_tag(tag: str):
     finally:
         model_tag = old_tag
 
-
+## Entry point from the install torch compiled
 class SGLangBackend:
 
     graph_pool: Any
@@ -364,6 +370,8 @@ class SGLangBackend:
     split_gm: fx.GraphModule
     piecewise_graphs: list[SplitItem]
     returned_callable: Callable
+
+    ## What inductor means? What is this?
     # Inductor passes to run on the graph pre-defunctionalization
     post_grad_passes: Sequence[Callable]
     sym_tensor_indices: list[int]
@@ -379,16 +387,21 @@ class SGLangBackend:
         assert graph_pool is not None
         self.graph_pool = graph_pool
 
+        ## According to docstring: The pass manager for post-grad passes. It handles configuration, adding custom passes, 
+        ## and running passes. It supports uuid for the Inductor code cache
+        ## What this means tho?
         self.post_grad_pass_manager = PostGradPassManager()
         self.sym_tensor_indices = []
         self.input_buffers = []
 
+        ## handles, compiling start, saving and loading of compiled
         self.compiler_manager = CompilerManager(config)
         self.inductor_config = {
             "enable_auto_functionalized_v2": False,
         }
         self.compile_config = config
 
+    ## What is post grad? Gradient? Why it needs a manager
     def configure_post_pass(self):
         self.post_grad_pass_manager.configure()
         self.inductor_config["post_grad_custom_post_pass"] = self.post_grad_pass_manager
@@ -416,17 +429,20 @@ class SGLangBackend:
         )
         compilation_counter.num_graphs_seen += 1
 
+        ## Is this on first run of the model? After that it will only pickup from the cached compiled state?
         assert not self._called, "SGLangBackend can only be called once"
 
         self.graph = graph
         self.configure_post_pass()
 
+        ## What is gm? Why are we splitting the graph even if we may not have called for piecewise graph in the args
         self.split_gm, self.piecewise_graphs = split_graph(
             graph,
             self.compile_config.split_ops,
         )
         from torch._dynamo.utils import lazy_format_graph_code
 
+        ## What this means?
         # depyf will hook lazy_format_graph_code and dump the graph
         # for debugging, no need to print the graph here
         lazy_format_graph_code("before split", self.graph)
@@ -440,6 +456,7 @@ class SGLangBackend:
             if not item.is_splitting_graph
         ]
 
+        ## Run the piecewise backend here
         PiecewiseCompileInterpreter(
             self.split_gm,
             submod_names_to_compile,

@@ -127,6 +127,7 @@ def set_torch_compile_config():
 class PiecewiseCudaGraphRunner:
     """A PiecewiseCudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
+    ## enable_mamba_extra_buffer + Radix cache enabled + no speculative decoding
     def is_mamba_track_enabled(self):
         return (
             self.model_runner.server_args.enable_mamba_extra_buffer()
@@ -136,11 +137,16 @@ class PiecewiseCudaGraphRunner:
 
     def __init__(self, model_runner: ModelRunner):
         # Parse args
+        ## Get args from parent
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
+
+        ## init empty graph and output buffer? doesnt seem to be used anywhere
         self.graphs = {}
         self.output_buffers = {}
+
+        ## getting args from parent
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
@@ -150,6 +156,7 @@ class PiecewiseCudaGraphRunner:
 
         set_torch_compile_config()
 
+        ## Needs piecewise_cuda_graph_tokens to be set, altho its auto generated too in server_args.py
         assert (
             self.model_runner.server_args.piecewise_cuda_graph_tokens is not None
         ), "piecewise_cuda_graph_tokens is not set"
@@ -174,6 +181,8 @@ class PiecewiseCudaGraphRunner:
         log_info_on_rank0(
             logger, f"Capture cuda graph num tokens {self.capture_num_tokens}"
         )
+
+        ## Which part of forward (prefill/decode/extend) and hidden states (null, last, all) we capturing
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
 
@@ -182,6 +191,8 @@ class PiecewiseCudaGraphRunner:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         self.max_num_tokens = max(self.capture_num_tokens)
+
+        # Max buffer size? batch size? seems like batch size
         self.max_bs = model_runner.req_to_token_pool.size
 
         self.is_multimodal = model_runner.is_multimodal
@@ -189,7 +200,11 @@ class PiecewiseCudaGraphRunner:
 
         # Graph inputs
         with torch.device(self.device):
+
+            ## dummy input ids with max bits
             self.input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+            
+            ## output cache location? what this means
             self.out_cache_loc = torch.zeros(
                 (self.max_num_tokens,), dtype=self._cache_loc_dtype()
             )
@@ -198,6 +213,8 @@ class PiecewiseCudaGraphRunner:
                 if model_runner.is_hybrid_swa
                 else None
             )
+
+            ## What these means for mamba?
             self.mamba_track_indices = (
                 torch.zeros((self.max_bs,), dtype=torch.int64)
                 if self.mamba_track_enabled
@@ -215,6 +232,7 @@ class PiecewiseCudaGraphRunner:
             )
             self.positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
 
+            ## Two batch overlap, what this means?
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
             if (
@@ -230,19 +248,29 @@ class PiecewiseCudaGraphRunner:
                 self.mrope_positions = torch.zeros(
                     (3, self.max_num_tokens), dtype=torch.int64
                 )
-
+        
+        ## Before coming here, we made of list of these type of layers in model runner class
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
 
+        ## cuda graph runner has the same, they use globally set graph memory pool, this in the gpu right?
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
+        ## These are context manager so all process can know what stage we are in right now, when this block is over
+        ## The global flag will be set back to false
         with enable_piecewise_cuda_graph():
+
+            ## We will first make the all the modules in model enter compile stage, then when block finishes
+            ## and we go out of context modules will exit compile stage
             with patch_model(
                 self.model_runner.model.model, self.compile_config.compiler
             ) as patched_model:
+                
+                ## makes the model compile on first run, then after that will use the compiled version
+                ## for future forward passes, this inits sglang compilation backend which has piecewise backend
                 install_torch_compiled(
                     patched_model,
                     fullgraph=True,
@@ -262,11 +290,14 @@ class PiecewiseCudaGraphRunner:
                             compile_range.set_description(
                                 f"Compiling num tokens ({num_tokens=})"
                             )
+                        ## why we need a warmup here?
                         self.warmup_torch_compile(num_tokens=num_tokens)
-
+                
+                ## Why setting global graph memory pool again?
                 set_global_graph_memory_pool(self.device_module.graph_pool_handle())
                 set_graph_pool_id(get_global_graph_memory_pool())
 
+                ## What does the synchronize do?
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
                 # Capture
@@ -383,6 +414,8 @@ class PiecewiseCudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
+
+        ## freezing the gc collection so it doesnt interfere with graph capturng
         with freeze_gc(
             self.model_runner.server_args.enable_cudagraph_gc
         ), graph_capture() as graph_capture_context:
@@ -530,6 +563,7 @@ class PiecewiseCudaGraphRunner:
         # run twice for warmup at the first time and cuda graph capture at the second time
         # detail lies in sglang/python/sglang/srt/compilation/cuda_piecewise_backend.py
         for _ in range(2):
+            ## what is this sync + barrier?
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
