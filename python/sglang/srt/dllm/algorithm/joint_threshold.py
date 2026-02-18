@@ -7,6 +7,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.utils import sample_from_logits_dllm
 
 
 class JointThreshold(DllmAlgorithm):
@@ -54,6 +55,7 @@ class JointThreshold(DllmAlgorithm):
         # For certain decoding rounds where the terminal step yields no state change,
         # this can be set to False to bypass the overhead of an idle forward pass.
         any_changed_in_last_step = False
+        t2t_logit_accum = [None] * batch_size
 
         max_iterations = self.block_size + self.max_post_edit_steps
         for _ in range(max_iterations):
@@ -104,25 +106,72 @@ class JointThreshold(DllmAlgorithm):
                     if not mask_transfer_index.any():
                         _, select_index = torch.topk(confidence, k=1)
                         mask_transfer_index[select_index] = True
+
+                    if self.sampling_info.is_all_greedy:
+                        # Original implementation
+                        curr_input_ids[mask_transfer_index] = x[mask_transfer_index]
+                    else:
+                        sampled, _ = sample_from_logits_dllm(
+                            curr_logits[mask_transfer_index], self.sampling_info, i
+                        )
+                        curr_input_ids[mask_transfer_index] = sampled
+
+                    any_changed_in_last_step = True
                 else:
                     post_edit_steps[i] += 1
                     if post_edit_steps[i] > self.max_post_edit_steps:
                         finished[i] = True
                         continue
 
-                # Token to token (T2T)
+                # T2T
                 edit_mask = ~mask_index & ~curr_prompt_mask
                 edit_transfer_index = (
                     (p > self.edit_threshold) & (curr_input_ids != x) & edit_mask
                 )
 
-                transfer_index = mask_transfer_index | edit_transfer_index
-                if not transfer_index.any():
-                    finished[i] = True
-                    continue
+                if self.sampling_info.is_all_greedy:
+                    # Original implementation
+                    transfer_index = mask_transfer_index | edit_transfer_index
+                    if not transfer_index.any():
+                        finished[i] = True
+                        continue
+                    curr_input_ids[transfer_index] = x[transfer_index]
+                    any_changed_in_last_step = True
+                else:
+                    if has_mask:
+                        # M2T already handled above, handle T2T greedy for this step
+                        if edit_transfer_index.any():
+                            curr_input_ids[edit_transfer_index] = x[edit_transfer_index]
+                            any_changed_in_last_step = True
+                    else:
+                        # T2T phase: accumulate logits
+                        if t2t_logit_accum[i] is None:
+                            t2t_logit_accum[i] = curr_logits.clone()
+                        else:
+                            t2t_logit_accum[i] += curr_logits
 
-                curr_input_ids[transfer_index] = x[transfer_index]
-                any_changed_in_last_step = True
+                        if post_edit_steps[i] >= self.max_post_edit_steps:
+                            # Sample once from aggregated distribution
+                            sampled_final, _ = sample_from_logits_dllm(
+                                t2t_logit_accum[i], self.sampling_info, i
+                            )
+                            final_transfer = edit_mask & (
+                                curr_input_ids != sampled_final
+                            )
+                            if final_transfer.any():
+                                curr_input_ids[final_transfer] = sampled_final[
+                                    final_transfer
+                                ]
+                                any_changed_in_last_step = True
+                            finished[i] = True
+                            continue
+
+                        # Intermediate T2T: greedy edits to keep sequence evolving
+                        if not edit_transfer_index.any():
+                            finished[i] = True
+                            continue
+                        curr_input_ids[edit_transfer_index] = x[edit_transfer_index]
+                        any_changed_in_last_step = True
 
         if any_changed_in_last_step:
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)

@@ -9,6 +9,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.utils import sample_from_logits_dllm
 
 
 class LowConfidence(DllmAlgorithm):
@@ -81,13 +82,27 @@ class LowConfidence(DllmAlgorithm):
                 x = torch.where(block_mask_index, x, block_input_ids)
                 confidence = torch.where(block_mask_index, p, -np.inf)
 
-                transfer_index = confidence > self.threshold
+                if self.sampling_info.is_all_greedy:
+                    transfer_index = confidence > self.threshold
+                    if transfer_index.sum().item() == 0:
+                        _, select_index = torch.topk(confidence, k=1)
+                        transfer_index[select_index] = True
+                    block_input_ids[transfer_index] = x[transfer_index]
+                else:
+                    above_threshold = confidence > self.threshold
+                    transfer_index = above_threshold.clone()
 
-                if transfer_index.sum().item() == 0:
-                    _, select_index = torch.topk(confidence, k=1)
-                    transfer_index[select_index] = True
-
-                block_input_ids[transfer_index] = x[transfer_index]
+                    if transfer_index.sum().item() == 0:
+                        # Forced commit: greedy fallback
+                        _, select_index = torch.topk(confidence, k=1)
+                        transfer_index[select_index] = True
+                        block_input_ids[transfer_index] = x[transfer_index]
+                    else:
+                        # Sample from positions that passed the confidence gate
+                        sampled, _ = sample_from_logits_dllm(
+                            curr_logits[transfer_index], self.sampling_info, batch_id
+                        )
+                        block_input_ids[transfer_index] = sampled
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph

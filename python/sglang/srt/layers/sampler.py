@@ -3,6 +3,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import get_tp_group
@@ -616,3 +617,29 @@ def apply_custom_logit_processor(
         logger.debug(
             f"Custom logit processor {processor.__class__.__name__} is applied."
         )
+
+
+def sample_from_logits_dllm(
+    logits: torch.Tensor, sampling_info, batch_id: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    t = sampling_info.temperatures[batch_id].clamp(min=1e-8)
+    scaled = logits / t
+    probs = F.softmax(scaled, dim=-1)
+
+    if sampling_info.need_top_k_sampling:
+        k = sampling_info.top_ks[batch_id].item()
+        if 0 < k < probs.shape[-1]:
+            topk_vals, _ = torch.topk(probs, k, dim=-1)
+            probs = probs.masked_fill(probs < topk_vals[:, -1:], 0.0)
+
+    if sampling_info.need_top_p_sampling:
+        p_thresh = sampling_info.top_ps[batch_id].item()
+        sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+        cumsum = torch.cumsum(sorted_probs, dim=-1)
+        sorted_probs = sorted_probs.masked_fill((cumsum - sorted_probs) > p_thresh, 0.0)
+        probs = torch.zeros_like(probs).scatter_(-1, sorted_idx, sorted_probs)
+
+    probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
+    sampled_probs = probs.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+    return sampled, sampled_probs
