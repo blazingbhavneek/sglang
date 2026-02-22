@@ -7,9 +7,9 @@ import torch.nn.functional as F
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import sample_from_logits_dllm
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import sample_from_logits_dllm
 
 
 class LowConfidence(DllmAlgorithm):
@@ -82,7 +82,7 @@ class LowConfidence(DllmAlgorithm):
                 x = torch.where(block_mask_index, x, block_input_ids)
                 confidence = torch.where(block_mask_index, p, -np.inf)
 
-                if self.sampling_info.is_all_greedy:
+                if forward_batch.sampling_info.is_all_greedy:
                     transfer_index = confidence > self.threshold
                     if transfer_index.sum().item() == 0:
                         _, select_index = torch.topk(confidence, k=1)
@@ -100,7 +100,9 @@ class LowConfidence(DllmAlgorithm):
                     else:
                         # Sample from positions that passed the confidence gate
                         sampled, _ = sample_from_logits_dllm(
-                            curr_logits[transfer_index], self.sampling_info, batch_id
+                            curr_logits[transfer_index],
+                            forward_batch.sampling_info,
+                            batch_id,
                         )
                         block_input_ids[transfer_index] = sampled
 

@@ -5,9 +5,9 @@ import torch.nn.functional as F
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import sample_from_logits_dllm
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import sample_from_logits_dllm
 
 
 class JointThreshold(DllmAlgorithm):
@@ -107,12 +107,14 @@ class JointThreshold(DllmAlgorithm):
                         _, select_index = torch.topk(confidence, k=1)
                         mask_transfer_index[select_index] = True
 
-                    if self.sampling_info.is_all_greedy:
+                    if forward_batch.sampling_info.is_all_greedy:
                         # Original implementation
                         curr_input_ids[mask_transfer_index] = x[mask_transfer_index]
                     else:
                         sampled, _ = sample_from_logits_dllm(
-                            curr_logits[mask_transfer_index], self.sampling_info, i
+                            curr_logits[mask_transfer_index],
+                            forward_batch.sampling_info,
+                            i,
                         )
                         curr_input_ids[mask_transfer_index] = sampled
 
@@ -129,7 +131,7 @@ class JointThreshold(DllmAlgorithm):
                     (p > self.edit_threshold) & (curr_input_ids != x) & edit_mask
                 )
 
-                if self.sampling_info.is_all_greedy:
+                if forward_batch.sampling_info.is_all_greedy:
                     # Original implementation
                     transfer_index = mask_transfer_index | edit_transfer_index
                     if not transfer_index.any():
@@ -153,7 +155,7 @@ class JointThreshold(DllmAlgorithm):
                         if post_edit_steps[i] >= self.max_post_edit_steps:
                             # Sample once from aggregated distribution
                             sampled_final, _ = sample_from_logits_dllm(
-                                t2t_logit_accum[i], self.sampling_info, i
+                                t2t_logit_accum[i], forward_batch.sampling_info, i
                             )
                             final_transfer = edit_mask & (
                                 curr_input_ids != sampled_final
