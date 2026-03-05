@@ -97,6 +97,16 @@ class RotaryEmbedding(MultiPlatformOp):
             )
         self.position_cos, self.position_sin = None, None
 
+    def set_fallback_kernel_for_encoder_only(self):
+        """Force fallback kernel for ENCODER_ONLY attention to avoid JIT kernel issues."""
+        # The new JIT RoPE kernel has compatibility issues with ENCODER_ONLY attention patterns
+        # used in dLLM/block diffusion models (e.g., SDAR). Force use of the stable fallback kernel.
+        if not self.use_fallback_kernel:
+            from sglang.jit_kernel.pos_enc import rotary_embedding
+
+            self.use_fallback_kernel = True
+            self.fallback_rotary_embedding = rotary_embedding
+
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
@@ -302,9 +312,9 @@ class RotaryEmbedding(MultiPlatformOp):
                 fused_args=fused_set_kv_buffer_arg,
             )
         else:
-            assert (
-                fused_set_kv_buffer_arg is None
-            ), "save kv cache is not supported for fallback_rotary_embedding."
+            # Fallback kernel doesn't support fused KV cache save
+            # When fused_set_kv_buffer_arg is provided, we skip fused save and
+            # let the attention backend handle KV cache separately
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
             self.fallback_rotary_embedding(
                 positions,

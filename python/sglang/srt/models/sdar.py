@@ -159,6 +159,8 @@ class SDARAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        # Force fallback kernel for ENCODER_ONLY attention to avoid JIT kernel issues
+        self.rotary_emb.set_fallback_kernel_for_encoder_only()
 
         # RadixAttention: ENCODER_ONLY lets ForwardBatch provide non-causal / block masks (dLLM)
         # NOTE: this is the key change vs AR Llama-style DECODER self-attn.
@@ -184,6 +186,12 @@ class SDARAttention(nn.Module):
             head_dim=self.head_dim,
             alt_stream=self.alt_stream,
         )
+        # Check if we can use fused RoPE + KV cache save
+        # Fallback kernel (used for ENCODER_ONLY) doesn't support fused KV cache
+        can_use_fused = (
+            enable_fused_set_kv_buffer(forward_batch)
+            and not self.rotary_emb.use_fallback_kernel
+        )
         q, k = self.rotary_emb(
             positions,
             q,
@@ -194,7 +202,7 @@ class SDARAttention(nn.Module):
                     layer=self.attn,
                     forward_batch=forward_batch,
                 )
-                if enable_fused_set_kv_buffer(forward_batch)
+                if can_use_fused
                 else None
             ),
         )
@@ -219,6 +227,12 @@ class SDARAttention(nn.Module):
             head_dim=self.head_dim,
             alt_stream=self.alt_stream,
         )
+        # Check if we can use fused RoPE + KV cache save
+        # Fallback kernel (used for ENCODER_ONLY) doesn't support fused KV cache
+        can_use_fused = (
+            enable_fused_set_kv_buffer(forward_batch)
+            and not self.rotary_emb.use_fallback_kernel
+        )
         q, k = self.rotary_emb(
             positions,
             q,
@@ -229,7 +243,7 @@ class SDARAttention(nn.Module):
                     layer=self.attn,
                     forward_batch=forward_batch,
                 )
-                if enable_fused_set_kv_buffer(forward_batch)
+                if can_use_fused
                 else None
             ),
         )
@@ -243,7 +257,7 @@ class SDARAttention(nn.Module):
             k,
             v,
             forward_batch,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            save_kv_cache=not can_use_fused,
         )
         out, _ = self.o_proj(context_layer)
         return out
